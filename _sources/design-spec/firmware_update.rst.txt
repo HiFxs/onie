@@ -204,7 +204,7 @@ This example shows:
 - executing the ``onie-fwpkg`` command with the ``add`` sub-command.  This
   stages the update in the ONIE-BOOT partition.
 
-- executing the ``onie-fwpkg`` command with the ``add`` sub-command.  This
+- executing the ``onie-fwpkg`` command with the ``show`` sub-command.  This
   displays any currently pending firmware updates.
 
 - executing the ``onie-boot-mode`` command to set the system into
