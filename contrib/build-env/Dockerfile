@@ -14,10 +14,10 @@ RUN sed -i 's/deb.debian.org/archive.debian.org/g' /etc/apt/sources.list && \
 # Add initial development packages
 RUN apt-get update && apt-get install -y \
     build-essential stgit u-boot-tools util-linux \
-    gperf device-tree-compiler python-all-dev python-dev xorriso \
+    gperf device-tree-compiler python-all-dev python-dev python3-dev xorriso \
     autoconf automake bison flex texinfo libtool libtool-bin \
     gawk libncurses5 libncurses5-dev bc \
-    dosfstools mtools pkg-config git wget help2man gettext libexpat1 \
+    dosfstools mtools pkg-config git wget help2man gettext autopoint libexpat1 \
     libexpat1-dev fakeroot python-sphinx rst2pdf \
     libelf-dev \
     gnupg2 \
@@ -56,5 +56,9 @@ RUN mkdir src
 RUN chown -R build:build .
 
 USER build
+
+RUN git config --global --add safe.directory '*' && \
+    git config --global user.name "ONIE Build" && \
+    git config --global user.email "build@example.com"
 
 CMD ["/bin/bash", "--login"]
