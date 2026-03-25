@@ -1,0 +1,252 @@
+diff --git a/drivers/mmc/host/sdhci-pci-core.c b/drivers/mmc/host/sdhci-pci-core.c
+index afbccfc..015c0e1 100644
+--- a/drivers/mmc/host/sdhci-pci-core.c
++++ b/drivers/mmc/host/sdhci-pci-core.c
+@@ -29,6 +29,7 @@
+ #include <linux/mmc/slot-gpio.h>
+ #include <linux/mmc/sdhci-pci-data.h>
+ #include <linux/acpi.h>
++#include <linux/init.h>
+ #include <linux/dmi.h>
+ 
+ #ifdef CONFIG_X86
+@@ -947,6 +948,29 @@ static int byt_emmc_probe_slot(struct sdhci_pci_slot *slot)
+ 	return 0;
+ }
+ 
++static int dnv_emmc_probe_slot(struct sdhci_pci_slot *slot)
++{
++	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
++				 MMC_CAP_HW_RESET | MMC_CAP_1_8V_DDR |
++				 MMC_CAP_CMD_DURING_TFR |
++				 MMC_CAP_WAIT_WHILE_BUSY;
++	slot->host->mmc->caps2 |= MMC_CAP2_HC_ERASE_SZ;
++	slot->hw_reset = sdhci_pci_int_hw_reset;
++	return 0;
++}
++
++static int dnv_emmc_hs_probe_slot(struct sdhci_pci_slot *slot)
++{
++	/* Remove 1.8V capability, if 1.8V is supported, it will be negotiated to DDR mode */
++	slot->host->mmc->caps |= MMC_CAP_8_BIT_DATA | MMC_CAP_NONREMOVABLE |
++				 MMC_CAP_HW_RESET |
++				 MMC_CAP_CMD_DURING_TFR |
++				 MMC_CAP_WAIT_WHILE_BUSY;
++	slot->host->mmc->caps2 |= MMC_CAP2_HC_ERASE_SZ;
++	slot->hw_reset = sdhci_pci_int_hw_reset;
++	return 0;
++}
++
+ static bool glk_broken_cqhci(struct sdhci_pci_slot *slot)
+ {
+ 	return slot->chip->pdev->device == PCI_DEVICE_ID_INTEL_GLK_EMMC &&
+@@ -1201,6 +1225,25 @@ static const struct sdhci_pci_fixes sdhci_intel_byt_emmc = {
+ 	.priv_size	= sizeof(struct intel_host),
+ };
+ 
++static struct sdhci_pci_fixes sdhci_intel_dnv_emmc = {
++#ifdef CONFIG_PM_SLEEP
++	.resume		= byt_resume,
++#endif
++#ifdef CONFIG_PM
++	.runtime_resume	= byt_runtime_resume,
++#endif
++	.allow_runtime_pm = true,
++	.probe_slot	= byt_emmc_probe_slot,
++	.add_host	= byt_add_host,
++	.remove_slot	= byt_remove_slot,
++	.quirks		= SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC |
++			  SDHCI_QUIRK_NO_LED,
++	.quirks2	= SDHCI_QUIRK2_PRESET_VALUE_BROKEN |
++			  SDHCI_QUIRK2_STOP_WITH_TC,
++	.ops		= &sdhci_intel_byt_ops,
++	.priv_size	= sizeof(struct intel_host),
++};
++
+ static const struct sdhci_pci_fixes sdhci_intel_glk_emmc = {
+ 	.allow_runtime_pm	= true,
+ 	.probe_slot		= glk_emmc_probe_slot,
+@@ -1768,6 +1811,8 @@ static int amd_probe(struct sdhci_pci_chip *chip)
+ 		}
+ 	}
+ 
++    pci_dev_put(smbus_dev);
++
+ 	if (gen == AMD_CHIPSET_BEFORE_ML || gen == AMD_CHIPSET_CZ)
+ 		chip->quirks2 |= SDHCI_QUIRK2_CLEAR_TRANSFERMODE_REG_BEFORE_CMD;
+ 
+@@ -1881,7 +1926,7 @@ static const struct pci_device_id pci_ids[] = {
+ 	SDHCI_PCI_DEVICE(INTEL, SPT_EMMC,  intel_byt_emmc),
+ 	SDHCI_PCI_DEVICE(INTEL, SPT_SDIO,  intel_byt_sdio),
+ 	SDHCI_PCI_DEVICE(INTEL, SPT_SD,    intel_byt_sd),
+-	SDHCI_PCI_DEVICE(INTEL, DNV_EMMC,  intel_byt_emmc),
++	SDHCI_PCI_DEVICE(INTEL, DNV_EMMC,  intel_dnv_emmc),
+ 	SDHCI_PCI_DEVICE(INTEL, CDF_EMMC,  intel_glk_emmc),
+ 	SDHCI_PCI_DEVICE(INTEL, BXT_EMMC,  intel_byt_emmc),
+ 	SDHCI_PCI_DEVICE(INTEL, BXT_SDIO,  intel_byt_sdio),
+@@ -2254,6 +2299,135 @@ static void sdhci_pci_runtime_pm_forbid(struct device *dev)
+ 	pm_runtime_get_noresume(dev);
+ }
+ 
++/* define by gohi, set in bios acpi dsdt table */
++#define EMMC_DSDT_MODE_HS400    0
++#define EMMC_DSDT_MODE_HS200    1
++#define EMMC_DSDT_MODE_DDR52    2
++#define EMMC_DSDT_MODE_SDR52    3
++
++static int sdhci_set_quirks2_by_dsdt(struct pci_dev *pdev)
++{
++    struct acpi_device *acpi_dev;
++    struct fwnode_handle *pfwnod = pdev->dev.fwnode;
++    u64 mode;
++	int ret;
++
++    /* Find acpi node through pci,
++    * the relationship between pci and acpi devices can be viewed through the /sys/bus file */
++    acpi_dev = container_of(pfwnod, struct acpi_device, fwnode);
++
++    /* DSDT need take node as: "Name (MODE, 0x0-)" */
++   	ret = acpi_evaluate_integer(acpi_dev->handle, "MODE", NULL, &mode);
++	if (ACPI_SUCCESS(ret)) {
++        dev_info(&pdev->dev, "SD controller get bus mode:0x%lld from dsts success.\n", mode);
++        switch(mode) {
++        case EMMC_DSDT_MODE_SDR52:
++            sdhci_intel_dnv_emmc.quirks2 |= SDHCI_QUIRK2_BROKEN_DDR50 | SDHCI_QUIRK2_BROKEN_HS200;
++            sdhci_intel_dnv_emmc.probe_slot = dnv_emmc_hs_probe_slot;
++            dev_info(&pdev->dev, "Configure SDHCI as SDR52 attribute through dsdt.\n");
++            break;
++        case EMMC_DSDT_MODE_DDR52:
++            sdhci_intel_dnv_emmc.quirks2 |= SDHCI_QUIRK2_BROKEN_HS200;
++            dev_info(&pdev->dev, "Configure SDHCI as DDR52 attribute through dsdt.\n");
++            break;
++        case EMMC_DSDT_MODE_HS200:
++            dev_info(&pdev->dev, "Configure SDHCI as HS200 attribute through dsdt.\n");
++            break;
++        case EMMC_DSDT_MODE_HS400:
++            sdhci_intel_dnv_emmc.quirks2 |= SDHCI_QUIRK2_CAPS_BIT63_FOR_HS400;
++            dev_info(&pdev->dev, "Configure SDHCI as HS400 attribute through dsdt.\n");
++            break;
++        default:
++            ret = EINVAL;
++            break;
++        }
++    } else {
++        ret = EINVAL;
++    }
++
++    return ret;
++}
++
++#ifndef COMMAND_LINE_SIZE
++#define COMMAND_LINE_SIZE 1024
++#endif
++
++int sdhci_cmdline_read(char *cmdline)
++{
++    mm_segment_t fs;
++    struct file *filp;
++    int ret = 0;
++
++    /* Basically, the kernel parameters with arch are not exported.
++     * In order to not have too much influence and generalization,
++     * use the proc file to obtain parameter information. */
++    filp = filp_open("/proc/cmdline", O_RDONLY, 0);
++    if (IS_ERR(filp)) {
++        filp = NULL;
++        goto exit;
++    }
++    fs = get_fs();
++    set_fs(KERNEL_DS);
++
++    ret = vfs_read(filp, cmdline, COMMAND_LINE_SIZE, &(filp->f_pos));
++    set_fs(fs);
++    if (ret < 0) {
++        goto exit;
++    }
++    filp_close(filp, NULL);
++
++    return 0;
++
++exit:
++    if (filp != NULL) {
++        filp_close(filp, NULL);
++    }
++
++    return -1;
++}
++
++static int sdhci_set_quirks2_by_cmdline(struct pci_dev *pdev)
++{
++    char *option, cmdline[COMMAND_LINE_SIZE];
++    int ret = 0;
++
++    memset(cmdline, 0, COMMAND_LINE_SIZE);
++
++    ret = sdhci_cmdline_read(cmdline);
++    if (ret) {
++        return ret;
++    }
++
++    option = strstr(cmdline, "sdhcimode=");
++    if (option == NULL) {
++        return EINVAL;
++    }
++
++    /* Count, sdhcimode= is it 10 bytes? */
++    option += 10;
++
++    if (!strncmp(option, "sdr52", 5)) {
++        sdhci_intel_dnv_emmc.quirks2 |= SDHCI_QUIRK2_BROKEN_DDR50 | SDHCI_QUIRK2_BROKEN_HS200;
++        /* Remove 1.8V ability */
++        sdhci_intel_dnv_emmc.probe_slot = dnv_emmc_hs_probe_slot;
++        dev_info(&pdev->dev, "Configure SDHCI as SDR52 attribute through cmdline.\n");
++    } else if (!strncmp(option, "ddr52", 5)) {
++        sdhci_intel_dnv_emmc.quirks2 |= SDHCI_QUIRK2_BROKEN_HS200;
++        dev_info(&pdev->dev, "Configure SDHCI as DDR52 attribute through cmdline.\n");
++    } else if (!strncmp(option, "hs200", 5)) {
++        dev_info(&pdev->dev, "Configure SDHCI as HS200 attribute through cmdline.\n");
++        ;
++    } else if (!strncmp(option, "hs400", 5)) {
++        sdhci_intel_dnv_emmc.quirks2 |= SDHCI_QUIRK2_CAPS_BIT63_FOR_HS400;
++        dev_info(&pdev->dev, "Configure SDHCI as HS400 attribute through cmdline.\n");
++    } else {
++        dev_info(&pdev->dev, "CSDHCI: Unknown cmdline option.\n");
++        return EINVAL;
++	}
++
++    return 0;
++}
++
+ static int sdhci_pci_probe(struct pci_dev *pdev,
+ 				     const struct pci_device_id *ent)
+ {
+@@ -2269,6 +2443,17 @@ static int sdhci_pci_probe(struct pci_dev *pdev,
+ 	dev_info(&pdev->dev, "SDHCI controller found [%04x:%04x] (rev %x)\n",
+ 		 (int)pdev->vendor, (int)pdev->device, (int)pdev->revision);
+ 
++    /* cmdline setting priority, the kernel parameters can be changed flexibly,
++     *  and Bios upgrades are not convenient or secure. */
++    ret = sdhci_set_quirks2_by_cmdline(pdev);
++    if (ret) {
++        ret = sdhci_set_quirks2_by_dsdt(pdev);
++        if (ret) {
++            sdhci_intel_dnv_emmc.quirks2 |= SDHCI_QUIRK2_CAPS_BIT63_FOR_HS400;
++            dev_info(&pdev->dev, "Configure SDHCI as default[HS400].\n");
++        }
++    }
++
+ 	ret = pci_read_config_byte(pdev, PCI_SLOT_INFO, &slots);
+ 	if (ret)
+ 		return ret;
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 4c5eb3a..601e3ee 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -351,6 +351,7 @@ struct mmc_host {
+ #define MMC_CAP2_HS200_1_2V_SDR	(1 << 6)        /* can support */
+ #define MMC_CAP2_HS200		(MMC_CAP2_HS200_1_8V_SDR | \
+ 				 MMC_CAP2_HS200_1_2V_SDR)
++#define MMC_CAP2_HC_ERASE_SZ    (1 << 9)        /* High-capacity erase size */
+ #define MMC_CAP2_CD_ACTIVE_HIGH	(1 << 10)	/* Card-detect signal active high */
+ #define MMC_CAP2_RO_ACTIVE_HIGH	(1 << 11)	/* Write-protect signal active high */
+ #define MMC_CAP2_NO_PRESCAN_POWERUP (1 << 14)	/* Don't power up before scan */
