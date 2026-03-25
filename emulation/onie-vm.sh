@@ -78,7 +78,7 @@ HARD_DRIVE_SIZE=1G
 UEFI_DOWNLOADS_DIR="${EMULATION_DIR}/uefi-downloads"
 
 # Copy from ovmf package installed on host system (Debian Linux example)
-UEFI_BIOS_SOURCE_VARS=/usr/share/OVMF/OVMF_VARS.fd
+UEFI_BIOS_SOURCE_VARS=/usr/share/OVMF/OVMF_VARS_4M.fd
 # Put UEFI BIOS files here
 UEFI_BIOS_DIR="${EMULATION_DIR}/uefi-bios"
 
@@ -89,7 +89,7 @@ UEFI_X86_BIOS_DIR="${UEFI_BIOS_DIR}/x86"
 UEFI_BIOS_VARS="${UEFI_X86_BIOS_DIR}/OVMF_VARS.fd"
 
 
-UEFI_BIOS_SOURCE_CODE=/usr/share/OVMF/OVMF_CODE.fd
+UEFI_BIOS_SOURCE_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd
 # Source code file for UEFI BIOS
 UEFI_BIOS_CODE="${UEFI_X86_BIOS_DIR}/OVMF_CODE.fd"
 
@@ -399,8 +399,8 @@ function fxnRunEmulation()
 {
 
     if [ -e /.dockerenv ];then
-        echo "ERROR: you probably don't want to try to run QEMU from inside a container. Exiting."
-        exit 1
+        echo "WARNING: Running QEMU from inside a container. Continuing anyway."
+        # exit 1
     fi
 
     #
