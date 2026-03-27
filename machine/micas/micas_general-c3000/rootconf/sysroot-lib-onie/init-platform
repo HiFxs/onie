@@ -1,0 +1,83 @@
+# This script fragment is sourced by /etc/init.d/init-arch.sh,
+# which in turn executes the init_platform_pre_arch() and
+# init_platform_post_arch() functions.
+
+export_e2_loc_if_exist()
+{
+  e2_bus=$1
+  e2_addr=$2
+  var_set=$3
+  e2_cfg_file="/etc/syseeprom.conf"
+
+  if [ -n "`(i2cdetect -y $e2_bus) |grep \" ${e2_addr#0x}\"`" ];then
+       [ -n $var_set ] && {
+            rm -f $e2_cfg_file
+            echo -e "onie_syseeprom_bus=$e2_bus\nonie_syseeprom_addr=$e2_addr" >> $e2_cfg_file
+       }
+       return 0
+  else
+     return 1
+  fi
+}
+
+get_e2_localtion()
+{
+    #gpio_i2c fist
+    e2_addr=0x56
+    gpio_i2c_bus=$(i2cdetect -l |grep gpio |awk -F'-|\t' '{print $2}'|head -n1)
+    [ -n "$gpio_i2c_bus" ] && export_e2_loc_if_exist $gpio_i2c_bus $e2_addr && return
+
+    #add 9641 if exist
+    smbus_bus=$(i2cdetect -l |grep SMBus |awk -F'-|\t' '{print $2}'|head -n1)
+    if export_e2_loc_if_exist $smbus_bus 0x10 ;then
+        echo wb_pca9641 0x10 > /sys/bus/i2c/devices/i2c-$smbus_bus/new_device
+        sleep 1
+    fi
+
+    #
+    e2_addr=0x57
+    export_e2_loc_if_exist 2 $e2_addr 1 && { i2cset -f -y 2 0x33 0xb0 0 ;return; }
+    e2_addr=0x56
+    export_e2_loc_if_exist $smbus_bus $e2_addr 1 && return
+
+}
+
+init_platform_post_arch()
+{
+	#
+	# Wait for the EEPROM to come up.  Or more specifically,
+	# wait for the cp2112 USB-to-I2C bridge to come up.
+	# USB device initialization can happen asynchronously
+	# and late.  We want the EEPROM to be available before
+	# the rest of user-level initialization.
+	#
+	sleep 1.5
+        get_e2_localtion
+	i=100
+	syseeprom_flag="0"
+	while true; do
+		if onie-syseeprom >/dev/null 2>&1; then
+			echo "EEPROM device found."
+			syseeprom_flag="0"
+			break
+		fi
+		
+		if [ $i -le 0 ]; then
+			echo "EEPROM device unavailable."
+			syseeprom_flag="1"
+			break
+		fi
+		if [ $(($i % 10)) -eq 0 ]; then
+			echo "Waiting for EEPROM device to become" \
+			     "available... $(($i / 10))"
+		fi
+		sleep 0.1
+		i=$(($i - 1))
+	done
+
+        update_common_image_args /etc/machine_board_id_product.conf /etc/machine-build.conf /etc/machine.conf\
+                                 /mnt/onie-boot/onie/grub/grub-machine.cfg
+
+}
+
+

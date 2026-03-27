@@ -1,0 +1,460 @@
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+index f71bb97..746ea09 100644
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -112,3 +112,4 @@ obj-$(CONFIG_GPIO_XILINX)	+= gpio-xilinx.o
+ obj-$(CONFIG_GPIO_XTENSA)	+= gpio-xtensa.o
+ obj-$(CONFIG_GPIO_ZEVIO)	+= gpio-zevio.o
+ obj-$(CONFIG_GPIO_ZYNQ)		+= gpio-zynq.o
++obj-y += rg-gpio-c3000.o
+diff --git a/drivers/gpio/rg-gpio-c3000.c b/drivers/gpio/rg-gpio-c3000.c
+new file mode 100644
+index 0000000..52a0b16
+--- /dev/null
++++ b/drivers/gpio/rg-gpio-c3000.c
+@@ -0,0 +1,445 @@
++/*
++ * Copyright (C) 2011 LAPIS Semiconductor Co., Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/pci.h>
++#include <linux/gpio.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/slab.h>
++#include <linux/platform_device.h>
++#include <linux/i2c.h>
++#include <linux/i2c-gpio.h>
++
++int g_c3000_gpio_error = 0;
++int g_c3000_gpio_debug = 0;
++int g_c3000_test_i2c = 0;
++
++module_param(g_c3000_gpio_error, int, S_IRUGO | S_IWUSR);
++module_param(g_c3000_gpio_debug, int, S_IRUGO | S_IWUSR);
++module_param(g_c3000_test_i2c, int, S_IRUGO | S_IWUSR);
++
++#define C3000_GPIO_DEBUG_VERBOSE(fmt, args...) do {                                        \
++    if (g_c3000_gpio_debug) { \
++        printk(KERN_ERR "[C3000_GPIO][VER][func:%s line:%d]\r\n"fmt, __func__, __LINE__, ## args); \
++    } \
++} while (0)
++
++#define C3000_GPIO_DEBUG_ERROR(fmt, args...) do {                                        \
++    if (g_c3000_gpio_error) { \
++        printk(KERN_ERR "[C3000_GPIO][ERR][func:%s line:%d]\r\n"fmt, __func__, __LINE__, ## args); \
++    } \
++} while (0)
++    
++#define C3000_GPIO_DEBUG_I2CTEST(fmt, args...) do {                                        \
++    if (g_c3000_test_i2c) { \
++        printk(KERN_ERR "[C3000_GPIO][TEST][func:%s line:%d]\r\n"fmt, __func__, __LINE__, ## args); \
++    } \
++} while (0)
++
++
++#define C3000_P2SB_DW0_PMODE_MASK               (0x1c00)
++#define C3000_P2SB_DW0_RX_EN_MASK               (0x200)
++#define C3000_P2SB_DW0_TX_EN_MASK               (0x100)
++
++struct p2sb_regs {
++	u32	pad_cfg_dw0;
++	u32	pad_cfg_dw1;
++};
++
++/* Specifies number of GPIO PINS */
++#define C3000_GPIO_PINS_NUMS        (147)
++/**
++ * struct p2sb_gpio_reg_data - The register store data.
++ * @ien_reg:	To store contents of IEN register.
++ * @imask_reg:	To store contents of IMASK register.
++ * @po_reg:	To store contents of PO register.
++ * @pm_reg:	To store contents of PM register.
++ * @im0_reg:	To store contents of IM0 register.
++ * @im1_reg:	To store contents of IM1 register.
++ * @gpio_use_sel_reg : To store contents of GPIO_USE_SEL register.
++ *		       (Only ML7223 Bus-n)
++ */
++struct p2sb_gpio_reg_data {
++	u32 pad_cfg_dw0;
++	u32 pad_cfg_dw1;
++};
++
++/**
++ * struct p2sb_gpio - GPIO private data structure.
++ * @base:			PCI base address of Memory mapped I/O register.
++ * @reg:			Memory mapped p2sb GPIO register list.
++ * @dev:			Pointer to device structure.
++ * @gpio:			Data for GPIO infrastructure.
++ * @p2sb_gpio_reg:		Memory mapped Register data is saved here
++ *				when suspend.
++ * @lock:			Used for register access protection
++ * @irq_base:		Save base of IRQ number for interrupt
++ * @ioh:		IOH ID
++ * @spinlock:		Used for register access protection
++ */
++struct p2sb_gpio {
++	void __iomem *base;
++	struct p2sb_regs __iomem *reg;
++	struct device *dev;
++	struct gpio_chip gpio;
++	struct p2sb_gpio_reg_data p2sb_gpio_reg;
++	int irq_base;
++	spinlock_t spinlock;
++};
++
++typedef struct p2sb_gpio_nr_map_s {
++    int nr;
++    int gpio;
++    int dw_base;
++} p2sb_gpio_nr_map_t;
++
++/****************** i2c adapter with gpio ***********************/
++#define GPIO_SDA        (44)
++#define GPIO_SCL        (45)
++
++#if 0
++static struct gpiod_lookup_table gpio_i2c_gpiod_table = {
++	.dev_id         = "i2c-gpio",
++	.table          = {
++		GPIO_LOOKUP(GPIO_NAME, GPIO_SDA,
++			    "sda", GPIO_ACTIVE_HIGH),
++		GPIO_LOOKUP(GPIO_NAME, GPIO_SCL,
++			    "scl", GPIO_ACTIVE_HIGH),
++		{ },
++	},
++};
++
++static struct i2c_gpio_platform_data i2c_pdata = {
++    .udelay = 10,
++    .scl_is_output_only = 0,
++    .sda_is_open_drain  = 0,
++    .scl_is_open_drain = 0,
++};
++#else
++
++static struct i2c_gpio_platform_data i2c_pdata = {
++    .sda_pin = GPIO_SDA,
++    .scl_pin = GPIO_SCL,
++    .udelay = 10,
++    .scl_is_output_only = 0,
++    .sda_is_open_drain  = 0,
++    .scl_is_open_drain = 0,
++};
++#endif
++
++static void i2c_gpio_release(struct device *dev)
++{
++    return;
++}
++
++static struct platform_device i2c_gpio = {
++    .name           = "i2c-gpio",
++    .num_resources  = 0,
++    .id             = -1,
++    
++    .dev = {
++        .platform_data = &i2c_pdata,
++        .release = i2c_gpio_release,
++    }
++};
++
++static p2sb_gpio_nr_map_t g_p2sb_gpio_map[] = {
++    {.nr = 4, .gpio = -1, .dw_base = 0xc50568},
++    {.nr = 5, .gpio = -1, .dw_base = 0xc50570},
++    {.nr = 6, .gpio = -1, .dw_base = 0xc50578},
++    {.nr = 7, .gpio = -1, .dw_base = 0xc50580},
++    {.nr = 9, .gpio = -1, .dw_base = 0xc505d0},
++    {.nr = 10, .gpio = -1, .dw_base = 0xc50710},
++    {.nr = 44, .gpio = -1, .dw_base = 0xc204f8},
++    {.nr = 45, .gpio = -1, .dw_base = 0xc20500},
++};
++
++
++static int p2sb_get_dwbase_from_nr(unsigned nr)
++{
++    int i;
++    for (i = 0; i < ARRAY_SIZE(g_p2sb_gpio_map); i++) {
++        if (g_p2sb_gpio_map[i].nr == nr) {
++            return g_p2sb_gpio_map[i].dw_base;
++        }
++    }
++
++    C3000_GPIO_DEBUG_ERROR("Not found nr %d dwbase.\n", nr);
++    return -1;
++}
++
++static void p2sb_gpio_set(struct gpio_chip *gpio, unsigned nr, int val)
++{
++	u32 reg_val;
++	struct p2sb_gpio *chip =	container_of(gpio, struct p2sb_gpio, gpio);
++	unsigned long flags;
++    int dw_base;
++
++    spin_lock_irqsave(&chip->spinlock, flags);
++    dw_base = p2sb_get_dwbase_from_nr(nr);
++    if (dw_base < 0) {
++        C3000_GPIO_DEBUG_ERROR("nr %d get dwbase failed %d.\n", nr, dw_base);
++        spin_unlock_irqrestore(&chip->spinlock, flags);
++        return;
++    }
++
++    chip->reg = chip->base + dw_base;
++	reg_val = ioread32(&chip->reg->pad_cfg_dw0);
++	if (val)
++		reg_val |= (1);
++	else
++		reg_val &= ~(1);
++
++	iowrite32(reg_val, &chip->reg->pad_cfg_dw0);
++	spin_unlock_irqrestore(&chip->spinlock, flags);
++    C3000_GPIO_DEBUG_I2CTEST("nr %d chip->reg->pad_cfg_dw0:%p reg_val=0x%x.\n", nr,&chip->reg->pad_cfg_dw0, reg_val);
++}
++
++static int p2sb_gpio_get(struct gpio_chip *gpio, unsigned nr)
++{
++	struct p2sb_gpio *chip =	container_of(gpio, struct p2sb_gpio, gpio);
++    int dw_base;
++    int g_val;
++    unsigned long flags;
++
++    spin_lock_irqsave(&chip->spinlock, flags);
++    dw_base = p2sb_get_dwbase_from_nr(nr);
++    if (dw_base < 0) {
++        C3000_GPIO_DEBUG_ERROR("nr %d get dwbase failed %d.\n", nr, dw_base);
++        spin_unlock_irqrestore(&chip->spinlock, flags);
++        return -1;
++    }
++
++    chip->reg = chip->base + dw_base;
++    //g_val = ioread32(&chip->reg->pad_cfg_dw0) & (1 << 1);
++    g_val = ((ioread32(&chip->reg->pad_cfg_dw0) >> 1) & 0x1);
++    C3000_GPIO_DEBUG_I2CTEST("nr %d chip->reg->pad_cfg_dw0:%p reg_val=0x%x.\n", nr,&chip->reg->pad_cfg_dw0, g_val);
++	C3000_GPIO_DEBUG_VERBOSE("nr %d chip->reg->pad_cfg_dw0:%p reg_val=0x%x.\n", nr,&chip->reg->pad_cfg_dw0, g_val);
++    spin_unlock_irqrestore(&chip->spinlock, flags);
++    
++	return g_val;
++}
++
++static int p2sb_gpio_direction_output(struct gpio_chip *gpio, unsigned nr,
++				     int val)
++{
++	struct p2sb_gpio *chip =	container_of(gpio, struct p2sb_gpio, gpio);
++	u32 reg_val;
++	unsigned long flags;
++    int dw_base;
++
++    spin_lock_irqsave(&chip->spinlock, flags);
++    dw_base = p2sb_get_dwbase_from_nr(nr);
++    if (dw_base < 0) {
++        C3000_GPIO_DEBUG_ERROR("nr %d get dwbase failed %d.\n", nr, dw_base);
++        spin_unlock_irqrestore(&chip->spinlock, flags);
++        return -1;
++    }
++
++    chip->reg = chip->base + dw_base;
++	reg_val = ioread32(&chip->reg->pad_cfg_dw0);
++    reg_val &= ~C3000_P2SB_DW0_PMODE_MASK;
++    reg_val &= ~C3000_P2SB_DW0_TX_EN_MASK;
++    reg_val |= C3000_P2SB_DW0_RX_EN_MASK;
++	if (val)
++		reg_val |= (1);
++	else
++		reg_val &= ~(1);
++	iowrite32(reg_val, &chip->reg->pad_cfg_dw0);
++	spin_unlock_irqrestore(&chip->spinlock, flags);
++    C3000_GPIO_DEBUG_I2CTEST("nr %d val %d chip->reg->pad_cfg_dw0:%p reg_val=0x%x.\n", nr, val, &chip->reg->pad_cfg_dw0, reg_val);
++	return 0;
++}
++
++static int p2sb_gpio_direction_input(struct gpio_chip *gpio, unsigned nr)
++{
++	struct p2sb_gpio *chip =	container_of(gpio, struct p2sb_gpio, gpio);
++	unsigned long flags;
++    u32 reg_val;
++    int dw_base;
++
++    spin_lock_irqsave(&chip->spinlock, flags);
++    dw_base = p2sb_get_dwbase_from_nr(nr);
++    if (dw_base < 0) {
++        C3000_GPIO_DEBUG_ERROR("nr %d get dwbase failed %d.\n", nr, dw_base);
++        spin_unlock_irqrestore(&chip->spinlock, flags);
++        return -1;
++    }
++
++    chip->reg = chip->base + dw_base;
++    C3000_GPIO_DEBUG_I2CTEST("nr %d dwbase 0x%x chip->reg %p chip->reg->pad_cfg_dw0:%p.\n", nr, dw_base, chip->reg, &chip->reg->pad_cfg_dw0);
++
++	reg_val = ioread32(&chip->reg->pad_cfg_dw0);
++    reg_val &= ~C3000_P2SB_DW0_PMODE_MASK;
++	reg_val &= ~C3000_P2SB_DW0_RX_EN_MASK;
++    reg_val |= C3000_P2SB_DW0_TX_EN_MASK;
++	iowrite32(reg_val, &chip->reg->pad_cfg_dw0);
++	spin_unlock_irqrestore(&chip->spinlock, flags);
++    
++    C3000_GPIO_DEBUG_I2CTEST("nr %d chip->reg->pad_cfg_dw0:%p reg_val=0x%x.\n", nr,&chip->reg->pad_cfg_dw0, reg_val);
++
++	return 0;
++}
++
++#if 0
++static int p2sb_gpio_to_irq(struct gpio_chip *gpio, unsigned offset)
++{
++	struct p2sb_gpio *chip = container_of(gpio, struct p2sb_gpio, gpio);
++	return chip->irq_base + offset;
++}
++#endif
++
++static void p2sb_gpio_setup(struct p2sb_gpio *chip)
++{
++	struct gpio_chip *gpio = &chip->gpio;
++
++    C3000_GPIO_DEBUG_VERBOSE("Enter dev_name(chip->dev): %s.\n", dev_name(chip->dev));
++	gpio->label = dev_name(chip->dev);
++	gpio->dev = chip->dev;
++	gpio->owner = THIS_MODULE;
++	gpio->direction_input = p2sb_gpio_direction_input;
++	gpio->get = p2sb_gpio_get;
++	gpio->direction_output = p2sb_gpio_direction_output;
++	gpio->set = p2sb_gpio_set;
++	gpio->dbg_show = NULL;
++	gpio->base = 0;
++	gpio->ngpio = C3000_GPIO_PINS_NUMS;
++	gpio->can_sleep = false;
++	gpio->to_irq = NULL;/*p2sb_gpio_to_irq;*/
++    
++}
++
++static int p2sb_gpio_probe(struct pci_dev *pdev,
++				    const struct pci_device_id *id)
++{
++	s32 ret, ret2;
++	struct p2sb_gpio *chip;
++
++    C3000_GPIO_DEBUG_VERBOSE("Enter.\n");
++	chip = kzalloc(sizeof(*chip), GFP_KERNEL);
++	if (chip == NULL) {
++        C3000_GPIO_DEBUG_ERROR("kzalloc failed.\n");
++		return -ENOMEM;
++    }
++
++    C3000_GPIO_DEBUG_VERBOSE("Begin to call pci_enable_device.\n");
++	chip->dev = &pdev->dev;
++	ret = pci_enable_device(pdev);
++	if (ret) {
++		dev_err(&pdev->dev, "%s : pci_enable_device FAILED", __func__);
++		goto err_pci_enable;
++	}
++
++/*	ret = pci_request_regions(pdev, KBUILD_MODNAME);
++	if (ret) {
++		dev_err(&pdev->dev, "pci_request_regions FAILED-%d", ret);
++		goto err_request_regions;
++	}*/
++
++	chip->base = pci_iomap(pdev, 0, 0);
++	if (!chip->base) {
++		dev_err(&pdev->dev, "%s : pci_iomap FAILED", __func__);
++		ret = -ENOMEM;
++		goto err_iomap;
++	}
++    C3000_GPIO_DEBUG_VERBOSE("chip->base 0x%p.\n", chip->base);
++	chip->reg = chip->base;
++	pci_set_drvdata(pdev, chip);
++	spin_lock_init(&chip->spinlock);
++	p2sb_gpio_setup(chip);
++    C3000_GPIO_DEBUG_VERBOSE("Begin to call gpiochip_add.\n");
++	ret = gpiochip_add(&chip->gpio);
++	if (ret) {
++		dev_err(&pdev->dev, "p2sb gpio: Failed to register GPIO ret %d.\n", ret);
++		goto err_gpiochip_add;
++	}
++
++#if 0
++	/* 挂接GPIO信息到GPIO框架 */
++    gpiod_add_lookup_table(&gpio_i2c_gpiod_table);
++    C3000_GPIO_DEBUG_ERROR("After gpiod_add_lookup_table.\n");
++
++    C3000_GPIO_DEBUG_VERBOSE("Begin to call platform_device_register.\n");
++    ret = platform_device_register(&i2c_gpio);
++    C3000_GPIO_DEBUG_VERBOSE("Begin to call platform_device_register ret %d.\n", ret);
++    if (ret) {
++        dev_err(&pdev->dev, "p2sb gpio: Failed to register i2c_gpio ret %d.\n", ret);
++        goto i2c_reg_adapter_err;
++    }
++#else
++    ret = platform_device_register(&i2c_gpio);
++    if (ret < 0) {
++        C3000_GPIO_DEBUG_ERROR("platform_device_register register i2c gpio fail(%d).\n", ret);
++        goto i2c_reg_adapter_err;
++    }
++#endif
++
++    C3000_GPIO_DEBUG_VERBOSE("GET REG[0xC20500]=0X%X", ioread32(chip->base + 0xC20500));
++    C3000_GPIO_DEBUG_VERBOSE("Finish p2sb_gpio_probe.\n");
++	return 0;
++
++
++i2c_reg_adapter_err:
++    gpiochip_remove(&chip->gpio);
++
++err_gpiochip_add:
++	pci_iounmap(pdev, chip->base);
++
++err_iomap:
++	pci_release_regions(pdev);
++
++err_request_regions:
++	pci_disable_device(pdev);
++
++err_pci_enable:
++	kfree(chip);
++	dev_err(&pdev->dev, "%s Failed returns %d\n", __func__, ret);
++	return ret;
++}
++
++static void p2sb_gpio_remove(struct pci_dev *pdev)
++{
++	int err;
++	struct p2sb_gpio *chip = pci_get_drvdata(pdev);
++
++	gpiochip_remove(&chip->gpio);
++	pci_iounmap(pdev, chip->base);
++	pci_release_regions(pdev);
++	pci_disable_device(pdev);
++	kfree(chip);
++}
++
++#define PCI_VENDOR_ID_C3000_P2SB             0x19dd
++static const struct pci_device_id p2sb_gpio_pcidev_id[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_VENDOR_ID_C3000_P2SB) },
++	{ 0, }
++};
++MODULE_DEVICE_TABLE(pci, p2sb_gpio_pcidev_id);
++
++static struct pci_driver p2sb_gpio_driver = {
++	.name = "p2sb_gpio",
++	.id_table = p2sb_gpio_pcidev_id,
++	.probe = p2sb_gpio_probe,
++	.remove = p2sb_gpio_remove,
++};
++
++module_pci_driver(p2sb_gpio_driver);
++
++MODULE_DESCRIPTION("C3000 P2SB GPIO PCI Driver");
++MODULE_LICENSE("GPL");
++
